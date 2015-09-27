@@ -1,0 +1,157 @@
+---
+title: "Predicting Exercise Manner From Body Monitors"
+output: html_document
+---
+### Introduction
+This project uses data gathered from a research study into using monitors attached to the body during weight lifting exercise to see whether it's possible to predict the manner in which someone performed the exercise from the monitoring data. Sensors were used to monitor the motions that subjects made while performing a weight lifting exercise either correctly or while making one of 4 common errors, for example not lifting the weight height enough or having their elbows in the wrong position. Our goal is to create a machine learning algorithm which will predict, from sensor data, which of the 4 types of common mistakes a subject was making or if they were performing the exercise correctly.
+
+Even though the class project description mentions commmercial products such as Fitbit and Jawbone, the research data seems to have been gathered with more complicated sensors, or at least with more sensors. While an individual typically wears a single Fitbit, the subjects in this study were wearing 3 sensors (at the waist, upper arm, and lower arm). An additional sensor was attached to the dumbbell for a total of 4 sensors. More information about the research protocol is available at http://groupware.les.inf.puc-rio.br/har .
+
+The data for the project is available in two files, which need to be downloaded before starting:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+### Data and feature selection
+The data consisted of nearly 20,000 records for which the manner of exercise (labelled A, B, C, D or E) was known, plus an additional 20 records for which the manner of exercise was not known. The goal is to predict the manner of exercise for the 20 unknowns. An outside party knows the 20 answers, so can tell us if our predictions are right or wrong. Start by reading in the data:
+
+```{r read_data, cache=TRUE}
+# Read in data
+orig_knowns <- read.csv('pml-training.csv')
+orig_unknowns <- read.csv('pml-testing.csv')
+
+# How big is the data?
+dim(orig_knowns)
+```
+
+An individual data point contains the sensor readings from a moment in time as the subject performs the exercise, with about 30 samples collected per second. The data set contains 160 variables. However, some of these variables are available at every interval, while others are summary variables calculated about once a second. The data available in every sample includes measurements such as roll, pitch, and yaw, while the summary data reports maxes, mins, averages, variances, etc. of the basic measurements.
+
+The main challenge of this project was to figure out which of the 160 variables were actually useful for the prediction task. To begin with I noted that none of the 20 unknowns included summary data, meaning that the known summary measurements could not be used to predict the unknown intervals. Excluding the summary variables vastly cut down on the number of predictors available, removing over 100 variables.
+
+There remained a small number of variables which were available for all the knowns and unknowns but which turned out to be unhelpful for prediction. One was row number. The ~20,000 known records are sorted by exercise manner (A-E), such that the first 5000 or so records all correspond to class A:
+
+```{r row_num_vs_type, echo=FALSE}
+plot(orig_knowns$X,orig_knowns$classe,xlab="Row number",ylab="Exercise class",yaxt='n')
+axis(2,at=1:5,labels=c('A','B','C','D','E'))
+```
+
+A model trained with this data will happily decide that when the row number is less than about 5000, the exercise type is 'A'. Since the unknowns are in a separate file with row numbers 1-20, this predictor will happily predict that all the unknowns are type A!
+
+Similarly the specific timestamp information (when the exercise was performed) is correlated with the exercise type is a way that is not generalizable. The variable num_window is closely related to raw timestamp and thus is also not helpful. In a more advanced model that looked at a sequence of motions across time within a time window we might want to keep window number, but the unknowns are all from different windows, precluding this sort of advanced analysis. Accordingly it is best to throw out num_window. 
+
+Finally the variable new_window tells only whether the record in question includes the summary information. The unknowns all have the same value for this variable ('no'), making it useless for predicting the exercise type. One possible strategy would be to only keep in the training data records that also had 'no' for this variable; in this end this was not needed since I got good results by just ignoring this varaible entirely (neither including it as a predictor nor filtering the training data on it).
+
+### Preprocessing
+#### 1. Removing unneeded features
+I define a function to strip out all the variables that have been identified as not useful for prediction, then apply that function to the original data (both knowns and unknowns) to create "stripped" versions containing only the useful values:
+```{r strip_columns}
+# Define the function to strip out columns we don't want to use
+strip_columns <- function(df){
+  df <- df[,-grep("^amplitude_",colnames(df))]
+  df <- df[,-grep("^max_",colnames(df))]
+  df <- df[,-grep("^min_",colnames(df))]
+  df <- df[,-grep("^skewness_",colnames(df))]
+  df <- df[,-grep("^stddev_",colnames(df))]
+  df <- df[,-grep("^var_",colnames(df))]
+  df <- df[,-grep("^kurtosis_",colnames(df))]
+  df <- df[,-grep("^avg_",colnames(df))]  
+  df <- df[,-grep("timestamp",colnames(df))]  
+  df <- subset(df,select=-c(X,num_window,new_window))
+  
+  return(df)
+}
+
+# Apply this function to the data
+stripped_knowns <- strip_columns(orig_knowns)
+stripped_unknowns <- strip_columns(orig_unknowns)
+
+# Now how big is the data?
+dim(stripped_knowns)
+```
+
+So from 160 original variables we are now down to just 54. Here's what's left:
+```{r show_column_names}
+names(stripped_knowns)
+```
+The final column (classe) encodes the manner of exercise that we wish to predict.
+
+#### 2. Preparing for cross-validation
+In order to estimate how well my model will perform on unseen data it has not trained on, I split the known data into two subsets, one to be used for training and the other to be used for validation. I use the caret package and apply a 70-30 split:
+```{r split_data, message=FALSE}
+# Split into training and validation sets
+library(caret)
+set.seed(888)
+inTrain <- createDataPartition(y=stripped_knowns$classe, p=0.7, list=FALSE)
+training <- stripped_knowns[inTrain,]
+validation <- stripped_knowns[-inTrain,]
+```
+(Note that there may be some confusion since the entire original data set of knowns was in a file called "pml-training.csv". I have adopted a naming convention in which I call that set of data the "knowns" and the subset of 70% of that data used for training the model "training". In everything that follows "training" refers to the 70% portion.)
+
+#### 3. Centering and scaling
+Next I center and scale the data using caret's preProcess function. The preprocessing must be calculated using only the training data; the object created can then be applied separately to the training, validation, and unknown data. The centering and scaling preprocessing requires that the input be entirely numerical, so I first create a data frame using only numerical values. 
+```{r}
+# Remove user_name and class for the purposes of centering and scaling the data
+training_num <- subset(training, select=-c(user_name,classe))
+validation_num <- subset(validation, select=-c(user_name,classe))
+
+# Calculate the preprocess object by centering and scaling the training data 
+preproc_cent_scale <- preProcess(training_num, method=c("center","scale"))
+
+# Apply the preprocess object to the numeric data, then add back in the user_name column
+training_cent_scale <- predict(preproc_cent_scale, training_num)
+user_name <- training$user_name
+training_cent_scale$user_name <- user_name
+
+validation_cent_scale <- predict(preproc_cent_scale, validation_num)
+user_name <- validation$user_name
+validation_cent_scale$user_name <- user_name
+```
+
+
+### Fitting the model
+Now I am ready to build a machine learning model. I chose the random forest method, and applied it to the centered and scaled data. (I also experimented with random forest using data preprocessed with principal component analysis, but I have chosen only one approach to present here.)
+
+```{r load_model_from_disk, echo=FALSE}
+# Note: because the model fitting is so CPU intensive I did not want to actually
+# execute the model building code again while knitting the HTML. Instead the
+# model was loaded from disk for the purposes of generating this HTML report.
+# The following chunk does show the actual code I originally ran to  build the model; 
+# I just suppressed running the code again during the write-up of the final report.
+
+load('fit_cent_scale.rda')
+confusionMatrix(fit_cent_scale)
+```
+
+```{r fit_model, eval=FALSE}
+# Fitting the model
+set.seed(888)
+fit_cent_scale <- train(x=training_cent_scale, y=training$classe, method='rf', importance=TRUE)
+confusionMatrix(fit_cent_scale)
+```
+
+
+### Cross-validation
+Now we use the 30% of the data held out for cross-validation in order to predict the out of sample error:
+
+```{r cross_validate, message=FALSE}
+# Generate predictions on the hold-out data to estimate the accuracy
+predictions <- predict(fit_cent_scale, validation_cent_scale)
+table(predictions, validation$classe)
+```
+From the confusion matrix we can see that this model classified 12 + 2 + 2 + 10 + 1 + 1 + 3 = 31 cases incorrectly, out of 5885 cases in the validation data set, which gives an estimated out of sample accuracy of 99.5%.
+
+### Final predictions
+Finally we can apply this model to the 20 unknown cases to generate 20 predictions:
+```{r predict_unknowns}
+# First preprocess the unknowns in the same way as the training data
+unknown_num <- subset(stripped_unknowns,select=-c(user_name,problem_id))
+unknown_cent_scale <- predict(preproc_cent_scale, unknown_num)
+user_name <- stripped_unknowns$user_name
+unknown_cent_scale$user_name <- user_name
+
+# Apply the predictions
+predictions_unknown <- as.data.frame(predict(fit_cent_scale,unknown_cent_scale))
+head(predictions_unknown, n=2)
+```
+(I've supressed the rest of the output to thwart cheating by future enrollees in this class.) When these results were submitted to the party that knew the answers, all 20 predictions were correct.
